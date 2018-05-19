@@ -3,6 +3,7 @@ package com.codacy.analysis.cli.command.analyse
 import java.util.concurrent.ForkJoinPool
 
 import better.files.File
+import cats.MonadError
 import cats.implicits._
 import com.codacy.analysis.cli.analysis.Analyser
 import com.codacy.analysis.cli.clients.api.ProjectConfiguration
@@ -23,18 +24,18 @@ import scala.collection.parallel.immutable.ParSet
 import scala.concurrent.{ExecutionContext, Future}
 import scala.util.{Failure, Success, Try}
 
-class AnalyseExecutor(toolInput: Option[String],
+class AnalyseExecutor[M[_], E](toolInput: Option[String],
                       directory: Option[File],
                       formatter: Formatter,
                       analyser: Analyser[Try],
                       uploader: Either[String, ResultsUploader],
                       fileCollector: FileCollector[Try],
                       remoteProjectConfiguration: Either[String, ProjectConfiguration],
-                      nrParallelTools: Option[Int])(implicit context: ExecutionContext) {
+                      nrParallelTools: Option[Int])(errorFn: String => E)(implicit context: ExecutionContext, monadError: MonadError[M, E]) {
 
   private val logger: Logger = getLogger
 
-  def run(): Future[Either[String, Unit]] = {
+  def run(): Future[M[Unit]] = {
     formatter.begin()
 
     val baseDirectory =
@@ -50,7 +51,7 @@ class AnalyseExecutor(toolInput: Option[String],
       tools <- tools(toolInput, localConfigurationFile, remoteProjectConfiguration, filesTarget)
     } yield (filesTarget, tools)
 
-    val analysisResult: Future[Either[String, Unit]] = filesTargetAndTool.fold(str => Future.successful(Left(str)), {
+    val analysisResult: Future[M[Unit]] = filesTargetAndTool.fold(str => Future.successful(monadError.raiseError(errorFn(str))), {
       case (filesTarget, tools) =>
         analyseAndUpload(tools, filesTarget, localConfigurationFile, nrParallelTools)
     })
@@ -63,27 +64,27 @@ class AnalyseExecutor(toolInput: Option[String],
   private def analyseAndUpload(tools: Set[Tool],
                                filesTarget: FilesTarget,
                                localConfigurationFile: Either[String, CodacyConfigurationFile],
-                               nrParallelTools: Option[Int]): Future[Either[String, Unit]] = {
+                               nrParallelTools: Option[Int]): Future[M[Unit]] = {
 
     val toolsPar: ParSet[Tool] = tools.par
 
     toolsPar.tasksupport = new ForkJoinTaskSupport(new ForkJoinPool(nrParallelTools.getOrElse(2)))
 
-    val uploads: Seq[Future[Either[String, Unit]]] = toolsPar.map { tool =>
+    val uploads: Seq[Future[M[Unit]]] = toolsPar.map { tool =>
       val hasConfigFiles = fileCollector.hasConfigurationFiles(tool, filesTarget)
       analyseAndUpload(tool, hasConfigFiles, filesTarget, localConfigurationFile)
     }(collection.breakOut)
 
-    val joinedUploads: Future[Seq[Either[String, Unit]]] = Future.sequence(uploads)
+    val joinedUploads: Future[Seq[M[Unit]]] = Future.sequence(uploads)
 
-    joinedUploads.map(sequenceWithFixedLeft("")(_))
+    joinedUploads.map(foldWithError("")(_))
   }
 
   private def analyseAndUpload(
     tool: Tool,
     toolHasConfigFiles: Boolean,
     filesTarget: FilesTarget,
-    localConfigurationFile: Either[String, CodacyConfigurationFile]): Future[Either[String, Unit]] = {
+    localConfigurationFile: Either[String, CodacyConfigurationFile]): Future[M[Unit]] = {
     val result: Try[Set[Result]] = for {
       fileTarget <- fileCollector.filter(tool, filesTarget, localConfigurationFile, remoteProjectConfiguration)
       toolConfiguration <- getToolConfiguration(
@@ -102,24 +103,31 @@ class AnalyseExecutor(toolInput: Option[String],
         logger.error(e)(s"Failed analysis for ${tool.name}")
     }
 
-    uploader.fold[Future[Either[String, Unit]]]({ message =>
+    uploader.fold[Future[M[Unit]]]({ message =>
       logger.warn(message)
-      Future.successful(().asRight[String])
+      Future.successful(monadError.pure(()))
     }, { upload =>
       for {
         results <- Future.fromTry(result)
         upl <- upload.sendResults(tool.name, results)
-      } yield upl
+      } yield eitherToM(upl)
     })
   }
 
-  private def sequenceWithFixedLeft[A](left: A)(eitherIterable: Seq[Either[A, Unit]]): Either[A, Unit] = {
-    eitherIterable
-      .foldLeft[Either[A, Unit]](Right(())) { (acc, either) =>
-        acc.flatMap(_ => either)
-      }
-      .left
-      .map(_ => left)
+  private def eitherToM[A](either: Either[String, A]): M[A] = {
+    either match {
+      case Left(error) => monadError.raiseError(errorFn(error))
+      case Right(value) => monadError.pure(value)
+    }
+  }
+
+  private def foldWithError[A](error: String)(mSeq: Seq[M[Unit]]): M[Unit] = {
+    mSeq.foldLeft[M[Unit]](monadError.pure(())) {
+      (acc, m) =>
+        acc.flatMap(_ => m)
+    }.recoverWith {
+      case _ => monadError.raiseError(errorFn(error))
+    }
   }
 
   private def getToolConfiguration(tool: Tool,

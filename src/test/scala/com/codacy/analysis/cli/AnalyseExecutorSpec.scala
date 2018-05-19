@@ -1,6 +1,7 @@
 package com.codacy.analysis.cli
 
 import better.files.File
+import cats.implicits._
 import com.codacy.analysis.cli.analysis.Analyser
 import com.codacy.analysis.cli.clients.api._
 import com.codacy.analysis.cli.command._
@@ -220,7 +221,7 @@ class AnalyseExecutorSpec extends Specification with NoLanguageFeatures with Moc
       resultsUploaderEither,
       fileCollector,
       remoteProjectConfiguration,
-      None).run() must beRight.awaitFor(Int.MaxValue.seconds)
+      None)(identity).run() must beRight.awaitFor(Int.MaxValue.seconds)
     // scalafix:on
   }
 
