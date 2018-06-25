@@ -23,8 +23,8 @@ import scala.util.{Failure, Success, Try}
 
 class AnalyseExecutor(toolInput: Option[String],
                       directory: Option[File],
-                      formatter: Formatter,
-                      analyser: Analyser[Try],
+                      formatter: Formatter = null,
+                      analyser: Analyser[Try] = null,
                       fileCollector: FileCollector[Try],
                       remoteProjectConfiguration: Either[String, ProjectConfiguration],
                       nrParallelTools: Option[Int],
