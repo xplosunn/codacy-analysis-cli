@@ -11,13 +11,16 @@ import com.codacy.analysis.core.clients.api.ProjectConfiguration
 import com.codacy.analysis.core.configuration.CodacyConfigurationFile
 import com.codacy.analysis.core.converters.ConfigurationHelper
 import com.codacy.analysis.core.files.{FileCollector, FilesTarget}
-import com.codacy.analysis.core.model.{CodacyCfg, Configuration, FileCfg, Result}
-import com.codacy.analysis.core.tools.{Tool, ToolCollector}
-import com.codacy.analysis.core.utils.SetOps
+import com.codacy.analysis.core.model._
+import com.codacy.analysis.core.tools._
+import com.codacy.analysis.core.utils.InheritanceOps.InheritanceOps
 import com.codacy.analysis.core.utils.TryOps._
+import com.codacy.analysis.core.utils.{LanguagesHelper, SetOps}
+import com.codacy.plugins.api.languages.Language
 import org.log4s.{Logger, getLogger}
 import play.api.libs.json.JsValue
 
+import scala.concurrent.duration.Duration
 import scala.sys.process.Process
 import scala.util.{Failure, Success, Try}
 
@@ -29,7 +32,8 @@ class AnalyseExecutor(toolInput: Option[String],
                       remoteProjectConfiguration: Either[String, ProjectConfiguration],
                       nrParallelTools: Option[Int],
                       allowNetwork: Boolean,
-                      forceFilePermissions: Boolean) {
+                      forceFilePermissions: Boolean,
+                      toolTimeout: Option[Duration] = Option.empty[Duration]) {
 
   private val logger: Logger = getLogger
 
@@ -47,21 +51,34 @@ class AnalyseExecutor(toolInput: Option[String],
       overrideFilePermissions(baseDirectory)
     }
 
-    val filesTargetAndTool: Either[String, (FilesTarget, Set[Tool])] = for {
+    val filesTargetAndTool: Either[String, (FilesTarget, Set[ITool])] = for {
       filesTarget <- fileCollector
         .list(baseDirectory, localConfigurationFile, remoteProjectConfiguration)
         .toRight("Could not access project files")
-      tools <- tools(toolInput, localConfigurationFile, remoteProjectConfiguration, filesTarget, allowNetwork)
+      tools <- allTools(
+        toolInput,
+        remoteProjectConfiguration,
+        LanguagesHelper.fromFileTarget(filesTarget, localConfigurationFile),
+        allowNetwork)
     } yield (filesTarget, tools)
 
     val analysisResult: Either[String, Seq[ExecutorResult]] = filesTargetAndTool.map {
       case (filesTarget, tools) =>
-        SetOps.mapInParallel(tools, nrParallelTools) { tool =>
-          val analysisResults: Try[Set[Result]] = analyseFiles(tool, filesTarget, localConfigurationFile)
-
-          analysisResults.foreach(results => formatter.addAll(results.to[List]))
-
-          ExecutorResult(tool.name, filesTarget.readableFiles, analysisResults)
+        SetOps.mapInParallel[ITool, ExecutorResult](tools, nrParallelTools) { tool: ITool =>
+          tool match {
+            case tool: Tool =>
+              val analysisResults = issues(tool, filesTarget, localConfigurationFile)
+              analysisResults.foreach(results => formatter.addAll(results.to[List]))
+              IssuesToolExecutorResult(tool.name, filesTarget.readableFiles, analysisResults)
+            case metricsTool: MetricsTool =>
+              val analysisResults = metrics(metricsTool, filesTarget, localConfigurationFile)
+              analysisResults.foreach(results => formatter.addAll(results.to[List]))
+              MetricsToolExecutorResult(metricsTool.languageToRun.name, filesTarget.readableFiles, analysisResults)
+            case duplicationTool: DuplicationTool =>
+              val analysisResults = duplication(duplicationTool, filesTarget, localConfigurationFile)
+              analysisResults.foreach(results => formatter.addAll(results.to[List]))
+              DuplicationToolExecutorResult()
+          }
         }
     }
 
@@ -70,10 +87,12 @@ class AnalyseExecutor(toolInput: Option[String],
     analysisResult
   }
 
-  private def analyseFiles(tool: Tool,
-                           filesTarget: FilesTarget,
-                           localConfigurationFile: Either[String, CodacyConfigurationFile]): Try[Set[Result]] = {
-    val fileTarget = fileCollector.filter(tool, filesTarget, localConfigurationFile, remoteProjectConfiguration)
+  private def issues(tool: Tool,
+                     filesTarget: FilesTarget,
+                     localConfigurationFile: Either[String, CodacyConfigurationFile]): Try[Set[ToolResult]] = {
+    val analysisFilesTarget =
+      fileCollector.filter(tool, filesTarget, localConfigurationFile, remoteProjectConfiguration)
+
     val toolHasConfigFiles = fileCollector.hasConfigurationFiles(tool, filesTarget)
 
     for {
@@ -82,8 +101,29 @@ class AnalyseExecutor(toolInput: Option[String],
         toolHasConfigFiles,
         localConfigurationFile,
         remoteProjectConfiguration)
-      results <- analyser.analyse(tool, fileTarget.directory, fileTarget.readableFiles, toolConfiguration)
+      results <- analyser
+        .analyse(tool, analysisFilesTarget.directory, analysisFilesTarget.readableFiles, toolConfiguration, toolTimeout)
     } yield results
+  }
+
+  private def metrics(metricsTool: MetricsTool,
+                      filesTarget: FilesTarget,
+                      localConfigurationFile: Either[String, CodacyConfigurationFile]): Try[Set[FileMetrics]] = {
+    val metricsFilesTarget =
+      fileCollector.filter(metricsTool, filesTarget, localConfigurationFile, remoteProjectConfiguration)
+
+    analyser.metrics(metricsTool, metricsFilesTarget.directory, Some(metricsFilesTarget.readableFiles))
+  }
+
+  private def duplication(
+    duplicationTool: DuplicationTool,
+    filesTarget: FilesTarget,
+    localConfigurationFile: Either[String, CodacyConfigurationFile]): Try[Set[DuplicationClone]] = {
+
+    val duplicationFilesTarget =
+      fileCollector.filter(duplicationTool, filesTarget, localConfigurationFile, remoteProjectConfiguration)
+
+    analyser.duplication(duplicationTool, duplicationFilesTarget.directory, duplicationFilesTarget.readableFiles)
   }
 
   private def getToolConfiguration(tool: Tool,
@@ -95,7 +135,7 @@ class AnalyseExecutor(toolInput: Option[String],
       projectConfig <- remoteConfiguration
       toolConfiguration <- projectConfig.toolConfiguration
         .find(_.uuid.equalsIgnoreCase(tool.uuid))
-        .toRight[String]("Could not find tool")
+        .toRight[String](s"Could not find configuration for tool ${tool.name}")
     } yield {
       val shouldUseConfigFile = toolConfiguration.notEdited && hasConfigFiles
       val shouldUseRemoteConfiguredPatterns = !shouldUseConfigFile && tool.allowsUIConfiguration && toolConfiguration.patterns.nonEmpty
@@ -153,13 +193,43 @@ class AnalyseExecutor(toolInput: Option[String],
 
 object AnalyseExecutor {
 
-  final case class ExecutorResult(toolName: String, files: Set[Path], analysisResults: Try[Set[Result]])
+  sealed trait ExecutorResult
+  final case class IssuesToolExecutorResult(toolName: String, files: Set[Path], analysisResults: Try[Set[ToolResult]])
+      extends ExecutorResult
+  final case class MetricsToolExecutorResult(language: String, files: Set[Path], analysisResults: Try[Set[FileMetrics]])
+      extends ExecutorResult
+  final case class DuplicationToolExecutorResult() extends ExecutorResult
+
+  def allTools(toolInput: Option[String],
+               remoteProjectConfiguration: Either[String, ProjectConfiguration],
+               languages: Set[Language],
+               allowNetwork: Boolean): Either[String, Set[ITool]] = {
+
+    def metricsTools = MetricsToolCollector.fromLanguages(languages)
+    def duplicationTools = DuplicationToolCollector.fromLanguages(languages)
+
+    toolInput match {
+      case None =>
+        val toolsEither = tools(toolInput, remoteProjectConfiguration, allowNetwork, languages)
+
+        toolsEither.map(_ ++ metricsTools ++ duplicationTools)
+
+      case Some("metrics") =>
+        Right(metricsTools.map(_.to[ITool]))
+
+      case Some("duplication") =>
+        Right(duplicationTools.map(_.to[ITool]))
+
+      case Some(_) =>
+        val toolsEither = tools(toolInput, remoteProjectConfiguration, allowNetwork, languages)
+        toolsEither.map(_.map(_.to[ITool]))
+    }
+  }
 
   def tools(toolInput: Option[String],
-            localConfiguration: Either[String, CodacyConfigurationFile],
             remoteProjectConfiguration: Either[String, ProjectConfiguration],
-            filesTarget: FilesTarget,
-            allowNetwork: Boolean): Either[String, Set[Tool]] = {
+            allowNetwork: Boolean,
+            languages: Set[Language]): Either[String, Set[Tool]] = {
 
     val toolCollector = new ToolCollector(allowNetwork)
 
@@ -169,9 +239,7 @@ object AnalyseExecutor {
     }
 
     def fromLocalConfig: Either[String, Set[Tool]] = {
-      toolCollector.fromFileTarget(
-        filesTarget,
-        localConfiguration.map(_.languageCustomExtensions.mapValues(_.toList).toList).getOrElse(List.empty))
+      toolCollector.fromLanguages(languages)
     }
 
     toolInput.map { toolStr =>
@@ -182,6 +250,5 @@ object AnalyseExecutor {
         e2 <- fromLocalConfig.left
       } yield s"$e1 and $e2"
     }
-
   }
 }

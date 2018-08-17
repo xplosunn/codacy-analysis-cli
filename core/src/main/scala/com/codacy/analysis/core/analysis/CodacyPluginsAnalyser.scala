@@ -4,7 +4,8 @@ import java.nio.file.Path
 
 import better.files.File
 import com.codacy.analysis.core.model._
-import com.codacy.analysis.core.tools.Tool
+import com.codacy.analysis.core.tools.{DuplicationTool, MetricsTool, Tool}
+import com.codacy.plugins.api.Source
 import org.log4s.{Logger, getLogger}
 
 import scala.concurrent.duration._
@@ -14,8 +15,12 @@ class CodacyPluginsAnalyser extends Analyser[Try] {
 
   private val logger: Logger = getLogger
 
-  override def analyse(tool: Tool, directory: File, files: Set[Path], config: Configuration): Try[Set[Result]] = {
-    val result = tool.run(directory, files, config, 10.minutes)
+  override def analyse(tool: Tool,
+                       directory: File,
+                       files: Set[Path],
+                       config: Configuration,
+                       timeout: Option[Duration] = Option.empty[Duration]): Try[Set[ToolResult]] = {
+    val result = tool.run(directory, files, config, timeout)
 
     result match {
       case Success(res) =>
@@ -25,6 +30,42 @@ class CodacyPluginsAnalyser extends Analyser[Try] {
     }
 
     result
+  }
+
+  override def metrics(metricsTool: MetricsTool,
+                       directory: File,
+                       files: Option[Set[Path]],
+                       timeout: Option[Duration] = Option.empty[Duration]): Try[Set[FileMetrics]] = {
+
+    val srcFiles = files.map(_.map(filePath => Source.File(filePath.toString)))
+
+    val result = metricsTool.run(directory, srcFiles, timeout)
+
+    result match {
+      case Success(res) =>
+        logger.info(s"Completed metrics for ${metricsTool.name} with ${res.size} results")
+      case Failure(e) =>
+        logger.error(e)(s"Failed metrics for ${metricsTool.name}")
+    }
+
+    result.map(_.to[Set])
+  }
+
+  override def duplication(duplicationTool: DuplicationTool,
+                           directory: File,
+                           files: Set[Path],
+                           timeout: Option[Duration] = Option.empty[Duration]): Try[Set[DuplicationClone]] = {
+
+    val result = duplicationTool.run(directory, files, timeout)
+
+    result match {
+      case Success(res) =>
+        logger.info(s"Completed duplication for ${duplicationTool.name} with ${res.size} results")
+      case Failure(e) =>
+        logger.error(e)(s"Failed duplication for ${duplicationTool.name}")
+    }
+
+    result.map(_.to[Set])
   }
 
 }

@@ -1,11 +1,18 @@
 package com.codacy.analysis.cli
 
+import java.nio.file.Path
+
 import better.files._
 import cats.implicits._
 import com.codacy.analysis.cli.analysis.ExitStatus
 import com.codacy.analysis.cli.clients.Credentials
 import com.codacy.analysis.cli.command.analyse.AnalyseExecutor
-import com.codacy.analysis.cli.command.analyse.AnalyseExecutor.ExecutorResult
+import com.codacy.analysis.cli.command.analyse.AnalyseExecutor.{
+  DuplicationToolExecutorResult,
+  ExecutorResult,
+  IssuesToolExecutorResult,
+  MetricsToolExecutorResult
+}
 import com.codacy.analysis.cli.command.{Analyse, CLIApp, Command}
 import com.codacy.analysis.cli.configuration.Environment
 import com.codacy.analysis.cli.formatter.Formatter
@@ -13,8 +20,10 @@ import com.codacy.analysis.core.analysis.Analyser
 import com.codacy.analysis.core.clients.CodacyClient
 import com.codacy.analysis.core.clients.api.ProjectConfiguration
 import com.codacy.analysis.core.files.FileCollector
+import com.codacy.analysis.core.model._
 import com.codacy.analysis.core.upload.ResultsUploader
 import com.codacy.analysis.core.utils.Logger
+import com.codacy.analysis.core.utils.SeqOps._
 import org.log4s.getLogger
 
 import scala.concurrent.ExecutionContext.Implicits.global
@@ -28,7 +37,11 @@ class MainImpl extends CLIApp {
 
   private val logger: org.log4s.Logger = getLogger
 
-  def run(command: Command): Unit = {
+  override def run(command: Command): Unit = {
+    exit(runCommand(command))
+  }
+
+  def runCommand(command: Command): Int = {
     command match {
       case analyse: Analyse =>
         cleanup(analyse.directory)
@@ -53,9 +66,11 @@ class MainImpl extends CLIApp {
           remoteProjectConfiguration,
           analyse.parallel,
           analyse.allowNetworkValue,
-          analyse.forceFilePermissionsValue).run()
+          analyse.forceFilePermissionsValue,
+          analyse.toolTimeout).run()
 
         val uploadResultFut = uploadResults(codacyClientOpt)(analyse.uploadValue, analyse.commitUuid, analysisResults)
+
         val uploadResult = if (analyse.uploadValue) {
           Try(Await.result(uploadResultFut, Duration.Inf)) match {
             case Failure(err) =>
@@ -70,12 +85,8 @@ class MainImpl extends CLIApp {
           }
         } else Right(())
 
-        exit(
-          new ExitStatus(analyse.maxAllowedIssues, analyse.failIfIncompleteValue)
-            .exitCode(analysisResults, uploadResult))
+        new ExitStatus(analyse.maxAllowedIssues, analyse.failIfIncompleteValue).exitCode(analysisResults, uploadResult)
     }
-
-    ()
   }
 
   private def uploadResults(codacyClientOpt: Option[CodacyClient])(
@@ -87,19 +98,87 @@ class MainImpl extends CLIApp {
       executorResults <- executorResultsEither
     } yield {
       uploaderOpt.map { uploader =>
-        val resultsToUpload = executorResults.flatMap {
-          case ExecutorResult(toolName, files, Success(results)) =>
-            logger.info(s"Going to upload ${results.size} results for $toolName")
-            Option(ResultsUploader.ToolResults(toolName, files, results))
+        val (issuesToolExecutorResult, metricsToolExecutorResult, _) =
+          executorResults
+            .partitionSubtypes[IssuesToolExecutorResult, MetricsToolExecutorResult, DuplicationToolExecutorResult]
 
-          case ExecutorResult(toolName, _, Failure(err)) =>
-            logger.warn(s"Skipping upload for $toolName since analysis failed: ${err.getMessage}")
-            Option.empty[ResultsUploader.ToolResults]
-        }
+        val issuesPerToolSeq = issuesPerTool(issuesToolExecutorResult)
+        val issuesResultsSeq: Seq[ResultsUploader.ToolResults] = issuesResults(issuesPerToolSeq)
 
-        uploader.sendResults(resultsToUpload)
+        val metricsPerLanguageSeq =
+          metricsPerLanguage(metricsToolExecutorResult)
+
+        val metricsResultsSeq: Seq[MetricsResult] = metricsResults(metricsPerLanguageSeq)
+
+        uploader.sendResults(issuesResultsSeq, metricsResultsSeq)
       }.getOrElse(Future.successful(().asRight[String]))
     }).fold(err => Future.successful(err.asLeft[Unit]), identity)
+  }
+
+  private def metricsResults(
+    languageAndToolResultSeq: Seq[(String, (Set[Path], Either[Throwable, Set[FileMetrics]]))]): Seq[MetricsResult] = {
+    languageAndToolResultSeq.groupBy {
+      case (language, _) => language
+    }.flatMap {
+      case (language, languageAndFileMetricsSeq) =>
+        languageAndFileMetricsSeq.map {
+          case (_, (files, Right(fileMetrics))) =>
+            MetricsResult(language, Right(fileWithMetrics(files, fileMetrics)))
+          case (_, (_, Left(err))) =>
+            MetricsResult(language, Left(err.getMessage))
+        }(collection.breakOut)
+    }(collection.breakOut)
+  }
+
+  private def fileWithMetrics(allFiles: Set[Path], fileMetrics: Set[FileMetrics]): Set[FileWithMetrics] = {
+    allFiles.map { file =>
+      val metrics = fileMetrics.find(_.filename == file).map { metrics =>
+        Metrics(
+          metrics.complexity,
+          metrics.loc,
+          metrics.cloc,
+          metrics.nrMethods,
+          metrics.nrClasses,
+          metrics.lineComplexities)
+      }
+      FileWithMetrics(file, metrics)
+    }
+  }
+
+  private def metricsPerLanguage(metricsToolExecutorResult: Seq[MetricsToolExecutorResult])
+    : Seq[(String, (Set[Path], Either[Throwable, Set[FileMetrics]]))] = {
+    metricsToolExecutorResult.flatMap {
+      case MetricsToolExecutorResult(language, files, Success(fileMetrics)) =>
+        Option((language, (files, Right(fileMetrics))))
+      case MetricsToolExecutorResult(language, files, Failure(err)) =>
+        Option((language, (files, Left(err))))
+    }
+  }
+
+  private def issuesResults(toolAndIssuesResults: Seq[(String, (Set[Path], Either[Throwable, Set[ToolResult]]))])
+    : Seq[ResultsUploader.ToolResults] = {
+    toolAndIssuesResults.groupBy {
+      case (toolName, _) => toolName
+    }.flatMap {
+      case (toolName, toolAndIssuesSeq) =>
+        toolAndIssuesSeq.map {
+          case (_, (files, Right(issues))) =>
+            ResultsUploader.ToolResults(toolName, files, Right(issues))
+          case (_, (files, Left(err))) =>
+            ResultsUploader.ToolResults(toolName, files, Left(err.getMessage))
+        }(collection.breakOut)
+
+    }(collection.breakOut)
+  }
+
+  private def issuesPerTool(issuesToolExecutorResult: Seq[IssuesToolExecutorResult])
+    : Seq[(String, (Set[Path], Either[Throwable, Set[ToolResult]]))] = {
+    issuesToolExecutorResult.flatMap {
+      case IssuesToolExecutorResult(tool, files, Success(results)) =>
+        Option((tool, (files, Right(results))))
+      case IssuesToolExecutorResult(tool, files, Failure(err)) =>
+        Option((tool, (files, Left(err))))
+    }
   }
 
   private def cleanup(directoryOpt: Option[File]): Unit = {

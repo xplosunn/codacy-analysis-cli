@@ -2,19 +2,18 @@ package com.codacy.analysis.core.model
 
 import java.nio.file.Path
 
+import com.codacy.plugins.api.metrics.LineComplexity
 import com.codacy.plugins.api.results
-
-sealed trait Location
-
-final case class FullLocation(line: Int, column: Int) extends Location {
-  override def toString: String = s"$line:$column"
-}
-
-final case class LineLocation(line: Int) extends Location {
-  override def toString: String = line.toString
-}
+import com.codacy.plugins.duplication.api.DuplicationCloneFile
 
 sealed trait Result
+
+final case class DuplicationClone(cloneLines: String, nrTokens: Int, nrLines: Int, files: Set[DuplicationCloneFile])
+    extends Result
+
+sealed trait ToolResult extends Result
+
+final case class FileError(filename: Path, message: String) extends ToolResult
 
 final case class Issue(patternId: results.Pattern.Id,
                        filename: Path,
@@ -22,20 +21,19 @@ final case class Issue(patternId: results.Pattern.Id,
                        level: results.Result.Level,
                        category: Option[results.Pattern.Category],
                        location: Location)
-    extends Result
+    extends ToolResult
 
 object Issue {
-
   final case class Message(text: String) extends AnyVal {
     override def toString: String = text
   }
-
 }
 
-final case class FileError(filename: Path, message: String) extends Result
-
-final case class FileResults(filename: Path, results: Set[Result])
-
-sealed trait ResultsSet
-
-final case class ToolResults(tool: String, fileResults: Set[FileResults]) extends ResultsSet
+final case class FileMetrics(filename: Path,
+                             complexity: Option[Int],
+                             loc: Option[Int],
+                             cloc: Option[Int],
+                             nrMethods: Option[Int],
+                             nrClasses: Option[Int],
+                             lineComplexities: Set[LineComplexity])
+    extends Result
